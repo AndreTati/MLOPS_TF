@@ -10,22 +10,19 @@ S3_KEY_PREFIX = "raw"
 
 default_args = {
     "owner": "airflow",
-    "start_date": datetime.datetime(2023, 1, 1),
-    "retries": 1,
+    "retries": 2,
+    "retry_delay": datetime.timedelta(minutes=1),
+
 }
-@dag(
-    dag_id="process_etl_train",
+@dag(schedule_interval="*/60 * * * *",
+    start_date=datetime.datetime(2026, 6, 1),
     catchup=False,
-    tags=["download", "etl", "train"],
+    tags=["download", "etl"],
     default_args=default_args,
 )
-def process_etl_train():
+def process_etl_split():
 
-    @task.virtualenv(
-        task_id="download_and_upload",
-        requirements=["kagglehub>=0.1.0", "boto3", "pandas"],
-        system_site_packages=True,
-    )
+    @task(task_id="download_and_upload")
     def download_and_upload(dataset_slug: str = DEFAULT_DATASET,
                             filename: str = DEFAULT_FILENAME,
                             target_dir: str = DEFAULT_DIR) -> str:
@@ -35,10 +32,7 @@ def process_etl_train():
         Devuelve la URI S3 del archivo subido.
         """
         import os
-        import shutil
-        import logging
         import pandas as pd
-        import boto3
         import kagglehub
         import awswrangler as wr
 
@@ -49,7 +43,7 @@ def process_etl_train():
 
         #Descargar el dataset desde Kaggle
         try:
-            logging.info("Descargando dataset %s desde Kaggle...", dataset_slug)
+            print(f"Descargando dataset {dataset_slug} desde Kaggle...")
             download_path = kagglehub.dataset_download(dataset_slug)
             candidate = os.path.join(download_path, filename)
             if not os.path.exists(candidate):
@@ -58,10 +52,10 @@ def process_etl_train():
                 if len(files) == 0:
                     raise FileNotFoundError(f"No se encontró {filename} ni otros CSV en {download_path}")
                 candidate = os.path.join(download_path, files[0])
-                logging.warning("Archivo solicitado no encontrado; usando %s", candidate)
+                print(f"Archivo solicitado no encontrado; usando {candidate}")
             dataframe = pd.read_csv(candidate)
         except Exception as exc:
-            logging.exception("Error descargando dataset desde Kaggle: %s", exc)
+            print(f"Error descargando dataset desde Kaggle: {exc}")
             raise
         
 
@@ -70,12 +64,10 @@ def process_etl_train():
                     path=data_path,
                     index=False)
         
+        return data_path
 
-    @task.virtualenv(
-        task_id="etl_data",
-        requirements=["boto3", "pandas"],
-        system_site_packages=True,
-    )
+
+    @task(task_id="etl_data")
     def etl_data(s3_uri: str) -> str:
         """
         Realiza un ETL simple sobre el dataset descargado y subido a S3.
@@ -98,12 +90,9 @@ def process_etl_train():
         processed_s3_uri = "s3://data/processed/processed_data.csv"
         wr.s3.to_csv(df=df_cleaned, path=processed_s3_uri, index=False)
         return processed_s3_uri
+    
 
-    @task.virtualenv(
-        task_id="split_data",
-        requirements=["boto3", "pandas", "scikit-learn"],
-        system_site_packages=True,
-    )
+    @task(task_id="split_data")
     def split_data(s3_uri):
         """
         Función para dividir el dataset procesado en conjuntos de entrenamiento y prueba.
@@ -117,7 +106,7 @@ def process_etl_train():
         # Leer el dataset procesado desde S3
         df = wr.s3.read_csv(s3_uri)
 
-        # Separar características y etiquetas (asumiendo que la última columna es la etiqueta)
+        # Separar target de features
         X = df.drop(columns=target)
         y = df[[target]]
 
@@ -136,4 +125,6 @@ def process_etl_train():
     etl_task = etl_data(download_task)
     split_task = split_data(etl_task)
 
-dag = process_etl_train()
+    download_task
+
+dag = process_etl_split()
