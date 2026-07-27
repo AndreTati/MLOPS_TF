@@ -2,11 +2,6 @@ import datetime
 
 from airflow.decorators import dag, task
 
-DEFAULT_DIR = "../data"
-DEFAULT_FILENAME = "dielectron.csv"
-DEFAULT_DATASET = "fedesoriano/cern-electron-collision-data" 
-S3_BUCKET = "data"
-S3_KEY_PREFIX = "raw"
 
 default_args = {
     "owner": "airflow",
@@ -14,7 +9,7 @@ default_args = {
     "retry_delay": datetime.timedelta(minutes=1),
 
 }
-@dag(schedule_interval="*/60 * * * *",
+@dag(
     start_date=datetime.datetime(2026, 6, 1),
     catchup=False,
     tags=["download", "etl"],
@@ -22,10 +17,12 @@ default_args = {
 )
 def process_etl_split():
 
-    @task(task_id="download_and_upload")
-    def download_and_upload(dataset_slug: str = DEFAULT_DATASET,
-                            filename: str = DEFAULT_FILENAME,
-                            target_dir: str = DEFAULT_DIR) -> str:
+    #@task(task_id="download_and_upload")
+    @task.virtualenv(
+        requirements=["awswrangler","pandas", "kagglehub"],  
+        system_site_packages=False
+    )
+    def download_and_upload() -> str:
 
         """
         Descarga el dataset de Kaggle (por slug) y lo sube a S3 (bucket 'data', key 'raw/<filename>').
@@ -35,6 +32,10 @@ def process_etl_split():
         import pandas as pd
         import kagglehub
         import awswrangler as wr
+
+        dataset_slug: str = "fedesoriano/cern-electron-collision-data"
+        filename: str = "dielectron.csv"
+        target_dir: str = "/tmp/data"
 
         data_path = "s3://data/raw/dielectron.csv"
 
@@ -46,6 +47,7 @@ def process_etl_split():
             print(f"Descargando dataset {dataset_slug} desde Kaggle...")
             download_path = kagglehub.dataset_download(dataset_slug)
             candidate = os.path.join(download_path, filename)
+            print(candidate)
             if not os.path.exists(candidate):
                 # intentar buscar archivos CSV dentro del directorio descargado
                 files = [f for f in os.listdir(download_path) if f.lower().endswith(".csv")]
@@ -67,7 +69,11 @@ def process_etl_split():
         return data_path
 
 
-    @task(task_id="etl_data")
+    
+    @task.virtualenv(
+        requirements=["awswrangler"],  
+        system_site_packages=False
+    )
     def etl_data(s3_uri: str) -> str:
         """
         Realiza un ETL simple sobre el dataset descargado y subido a S3.
@@ -92,7 +98,11 @@ def process_etl_split():
         return processed_s3_uri
     
 
-    @task(task_id="split_data")
+    
+    @task.virtualenv(
+        requirements=["awswrangler", "scikit-learn"],  
+        system_site_packages=False
+    )
     def split_data(s3_uri):
         """
         Función para dividir el dataset procesado en conjuntos de entrenamiento y prueba.
