@@ -44,6 +44,7 @@ x-airflow-common: &airflow-common
     AWS_DEFAULT_REGION: us-east-1
     #AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.session'
     #AIRFLOW__CORE__TEST_CONNECTION: 'Enabled'
+    MLFLOW_TRACKING_URI: http://mlflow:5000
   volumes:
     - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-./airflow}/logs:/opt/airflow/logs
@@ -319,6 +320,34 @@ services:
     entrypoint: >
       /bin/sh -c ' sleep 5; /usr/bin/mc alias set s3 http://s3:9000 ${MINIO_ACCESS_KEY:-minio} ${MINIO_SECRET_ACCESS_KEY:-minio123}; /usr/bin/mc mb s3/${BUCKET_NAME:-data}; exit 0; '
 
+
+mlflow:
+    restart: always
+    build: './dockerfiles/mlflow'
+    container_name: mlflow
+    ports:
+      - "5000:5000"
+    networks:
+      - backend
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minio}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY:-minio123}
+      MLFLOW_S3_ENDPOINT_URL: http://s3:9000
+    volumes:
+      - mlflow_data:/mlflow_data
+    depends_on:
+      - s3
+
+  create_mlflow_bucket:
+    image: minio/mc:latest
+    depends_on:
+      - s3
+    networks:
+      - backend
+    entrypoint: >
+      /bin/sh -c ' sleep 5; /usr/bin/mc alias set s3 http://s3:9000 ${MINIO_ACCESS_KEY:-minio} ${MINIO_SECRET_ACCESS_KEY:-minio123}; /usr/bin/mc mb s3/mlflow; exit 0; '
+
+      
 networks:
   backend:
     driver: bridge
@@ -326,3 +355,5 @@ networks:
 volumes:
   db_data:
   minio_data:
+  mlflow_data:
+
