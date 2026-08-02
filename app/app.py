@@ -1,367 +1,309 @@
-import kagglehub
+"""Entrenamiento reproducible del modelo de masa invariante dielectron.
+
+Este módulo constituye el circuito de entrenamiento de la entrega parcial.
+Recibe el dataset desde un directorio local (y lo descarga de Kaggle solo si no
+está disponible), entrena un Gradient Boosting Regressor, guarda sus artefactos
+y registra la ejecución en MLflow con un backend SQLite local.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
 import os
 import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import joblib
+import kagglehub
+import mlflow
 import numpy as np
-import pandas as pd
-import pickle
-import warnings
-warnings.filterwarnings('ignore')
-
-from sklearn.model_selection import train_test_split, cross_val_score, KFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-
 import optuna
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
 
 
-def print_section(title):
-    """Imprime un encabezado de sección formateado."""
-    print("\n" + "=" * 70)
-    print(title)
-    print("=" * 70)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOGGER = logging.getLogger(__name__)
 
 
-def download_and_load_dataset(dataset_dir, csv_file):
-    """
-    Descarga el dataset desde Kaggle si no existe, o lo carga si ya está disponible.
-    
-    Args:
-        dataset_dir: Directorio donde se almacena el dataset
-        csv_file: Ruta completa al archivo CSV
-    
-    Returns:
-        DataFrame con los datos cargados
-    """
-    print_section("DESCARGA Y VALIDACIÓN DEL DATASET")
-    
-    os.makedirs(dataset_dir, exist_ok=True)
-    os.environ["KAGGLE_CACHE_DIR"] = dataset_dir
-    
-    # Verificar si el archivo ya existe
-    if os.path.exists(csv_file):
-        print(f"✓ Dataset encontrado en: {csv_file}")
-        print("  (usando dataset existente, no descargando de nuevo)")
-    else:
-        print("Dataset no encontrado. Descargando desde Kaggle...")
+@dataclass(frozen=True)
+class TrainingConfig:
+    """Parámetros que identifican y hacen reproducible una ejecución."""
+
+    dataset_dir: Path = PROJECT_ROOT / "datasets"
+    artifacts_dir: Path = PROJECT_ROOT / "artifacts"
+    tracking_uri: str = f"sqlite:///{PROJECT_ROOT / 'mlflow.db'}"
+    experiment_name: str = "dielectron-gradient-boosting"
+    random_state: int = 42
+    test_size: float = 0.20
+    n_trials: int = 10
+    cv_folds: int = 5
+
+
+def configure_logging() -> None:
+    """Configura mensajes breves y comparables entre ejecuciones."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+def download_and_load_dataset(dataset_dir: Path) -> pd.DataFrame:
+    """Carga ``dielectron.csv`` o lo descarga desde Kaggle si no existe."""
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    csv_file = dataset_dir / "dielectron.csv"
+    os.environ["KAGGLE_CACHE_DIR"] = str(dataset_dir)
+
+    if not csv_file.exists():
+        LOGGER.info("Dataset no encontrado; se descarga desde Kaggle.")
         try:
-            path = kagglehub.dataset_download("fedesoriano/cern-electron-collision-data")
-            data_file_path = os.path.join(path, 'dielectron.csv')
-            shutil.copy(data_file_path, csv_file)
-            print(f"✓ Dataset descargado y guardado en: {csv_file}")
-        except Exception as e:
-            print(f"✗ Error descargando dataset: {e}")
-            raise
-    
-    df = pd.read_csv(csv_file)
-    
-    print(f"\n✓ Dimensiones del dataset: {df.shape}")
-    print(f"\nColumnas disponibles:")
-    for col in df.columns:
-        print(f"  - {col}")
-    
-    return df
+            downloaded_dir = Path(
+                kagglehub.dataset_download("fedesoriano/cern-electron-collision-data")
+            )
+            shutil.copy2(downloaded_dir / "dielectron.csv", csv_file)
+        except Exception as exc:
+            raise RuntimeError(
+                "No se pudo obtener dielectron.csv. Verificá la conexión y la "
+                "configuración local de Kaggle, o colocá el archivo en datasets/."
+            ) from exc
+    else:
+        LOGGER.info("Se reutiliza el dataset local: %s", csv_file)
+
+    dataframe = pd.read_csv(csv_file)
+    LOGGER.info("Dataset cargado: %s filas y %s columnas.", *dataframe.shape)
+    return dataframe
 
 
-def preprocess_data(df, target_col='M', exclude_cols=None):
-    """
-    Preprocesa el dataset: selecciona features, limpia NaN y realiza split train/test.
-    
-    Args:
-        df: DataFrame con los datos
-        target_col: Nombre de la columna objetivo
-        exclude_cols: Lista de columnas a excluir
-    
-    Returns:
-        Tupla: (X_train, X_test, y_train, y_test, scaler, X, y, features, target)
-    """
-    print_section("PREPROCESAMIENTO")
-    
-    if exclude_cols is None:
-        exclude_cols = ['Run', 'Event']
-    
-    # Selección de features
-    features = [col for col in df.columns 
-                if col != target_col and col not in exclude_cols]
-    
-    print(f"\nFeatures ({len(features)}): {features}")
-    print(f"Target: {target_col}")
-    
-    # Limpieza de NaN
-    df_clean = df[features + [target_col]].dropna()
-    filas_eliminadas = len(df) - len(df_clean)
-    
-    print(f"\nFilas originales : {len(df)}")
-    print(f"Filas con NaN    : {filas_eliminadas}")
-    print(f"Filas utilizables: {len(df_clean)}")
-    
-    X = df_clean[features].copy()
-    y = df_clean[target_col].copy()
-    
-    # Verificación final
-    assert X.isnull().sum().sum() == 0, "Aún hay NaN en X"
-    assert y.isnull().sum() == 0, "Aún hay NaN en y"
-    print("\n✓ Verificación OK: sin valores NaN en X ni en y.")
-    
-    # Train / Test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
+def preprocess_data(
+    dataframe: pd.DataFrame,
+    random_state: int,
+    test_size: float,
+    target_col: str = "M",
+    exclude_cols: tuple[str, ...] = ("Run", "Event"),
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, list[str]]:
+    """Selecciona variables, elimina nulos y separa train/test reproduciblemente."""
+    if target_col not in dataframe.columns:
+        raise ValueError(f"No se encontró la columna objetivo {target_col!r}.")
+
+    features = [
+        column
+        for column in dataframe.columns
+        if column != target_col and column not in exclude_cols
+    ]
+    clean_dataframe = dataframe[features + [target_col]].dropna().copy()
+    removed_rows = len(dataframe) - len(clean_dataframe)
+    if clean_dataframe.empty:
+        raise ValueError("No quedaron observaciones luego de eliminar valores nulos.")
+
+    x = clean_dataframe[features]
+    y = clean_dataframe[target_col]
+    x_train, x_test, y_train, y_test = train_test_split(
+        x, y, test_size=test_size, random_state=random_state
     )
-    
-    print(f"\nTamaño entrenamiento: {X_train.shape[0]} muestras")
-    print(f"Tamaño prueba:        {X_test.shape[0]} muestras")
-    
-    # Escalado
-    scaler = StandardScaler()
-    X_train_sc = scaler.fit_transform(X_train)
-    X_test_sc = scaler.transform(X_test)
-    
-    print(f"\n✓ Datos escalados y listos para entrenamiento")
-    
-    return X_train, X_test, y_train, y_test, scaler, X, y, features, target_col
-
-
-def optimize_hyperparameters(X_train, y_train, n_trials=10):
-    """
-    Busca hiperparámetros óptimos para Gradient Boosting usando Optuna.
-    
-    Args:
-        X_train: Features de entrenamiento
-        y_train: Target de entrenamiento
-        n_trials: Número de trials para la búsqueda
-    
-    Returns:
-        Diccionario con los mejores parámetros
-    """
-    print_section("BÚSQUEDA DE HIPERPARÁMETROS (OPTUNA)")
-    
-    # Subconjunto para búsqueda rápida
-    X_train_sub, _, y_train_sub, _ = train_test_split(
-        X_train, y_train, train_size=0.3, random_state=42
+    LOGGER.info(
+        "Preprocesamiento: %s variables; %s filas eliminadas; train=%s, test=%s.",
+        len(features),
+        removed_rows,
+        len(x_train),
+        len(x_test),
     )
-    
-    # Función objetivo
-    def objective(trial):
-        params = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 200),
-            'max_depth': trial.suggest_int('max_depth', 3, 7),
-            'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.2),
-            'random_state': 42
+    return x_train, x_test, y_train, y_test, features
+
+
+def optimize_hyperparameters(
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    random_state: int,
+    n_trials: int,
+) -> dict[str, Any]:
+    """Selecciona hiperparámetros mediante una búsqueda Optuna acotada."""
+    x_subset, _, y_subset, _ = train_test_split(
+        x_train, y_train, train_size=0.30, random_state=random_state
+    )
+
+    def objective(trial: optuna.Trial) -> float:
+        parameters = {
+            "n_estimators": trial.suggest_int("n_estimators", 50, 200),
+            "max_depth": trial.suggest_int("max_depth", 3, 7),
+            "learning_rate": trial.suggest_float("learning_rate", 0.05, 0.20),
+            "random_state": random_state,
         }
-        model = GradientBoostingRegressor(**params)
-        score = cross_val_score(
-            model, X_train_sub, y_train_sub, cv=2, scoring='r2', n_jobs=-1
+        model = GradientBoostingRegressor(**parameters)
+        scores = cross_val_score(
+            model, x_subset, y_subset, cv=2, scoring="r2", n_jobs=-1
         )
-        return score.mean()
-    
-    # Ejecutar optimización
-    print(f"\nIniciando búsqueda de hiperparámetros ({n_trials} trials)...")
-    study = optuna.create_study(direction='maximize')
+        return float(scores.mean())
+
+    study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-    
-    best_params = study.best_params
-    print(f"\n✓ Mejor R² en búsqueda: {study.best_value:.6f}")
-    print(f"✓ Mejores parámetros: {best_params}")
-    
-    return best_params
+    best_parameters = {**study.best_params, "random_state": random_state}
+    LOGGER.info("Mejor R² de búsqueda: %.6f.", study.best_value)
+    return best_parameters
 
 
-def train_model(X_train, y_train, best_params):
-    """
-    Entrena el modelo Gradient Boosting con parámetros optimizados.
-    
-    Args:
-        X_train: Features de entrenamiento
-        y_train: Target de entrenamiento
-        best_params: Diccionario con los mejores parámetros
-    
-    Returns:
-        Modelo entrenado
-    """
-    print_section("ENTRENAMIENTO DEL MODELO FINAL")
-    
-    print("\nEntrenando Gradient Boosting con set completo de entrenamiento...")
-    gb_model = GradientBoostingRegressor(**best_params, random_state=42)
-    gb_model.fit(X_train, y_train)
-    print("✓ Modelo entrenado exitosamente")
-    
-    return gb_model
+def evaluate_model(
+    model: GradientBoostingRegressor,
+    x_test: pd.DataFrame,
+    y_test: pd.Series,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    cv_folds: int,
+    random_state: int,
+) -> dict[str, float]:
+    """Evalúa el modelo en test y mediante validación cruzada sobre train."""
+    predictions = model.predict(x_test)
+    nonzero_target = y_test.to_numpy() != 0
+    mape = float(
+        np.mean(
+            np.abs(
+                (y_test.to_numpy()[nonzero_target] - predictions[nonzero_target])
+                / y_test.to_numpy()[nonzero_target]
+            )
+        )
+        * 100
+    ) if nonzero_target.any() else float("nan")
 
+    cv_model = GradientBoostingRegressor(**model.get_params())
+    folds = KFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
+    cv_rmse = np.sqrt(
+        -cross_val_score(
+            cv_model,
+            x_train,
+            y_train,
+            cv=folds,
+            scoring="neg_mean_squared_error",
+            n_jobs=-1,
+        )
+    )
+    cv_r2 = cross_val_score(cv_model, x_train, y_train, cv=folds, scoring="r2", n_jobs=-1)
 
-def evaluate_model(gb_model, X_test, y_test, X, y):
-    """
-    Calcula las métricas de evaluación del modelo.
-    
-    Args:
-        gb_model: Modelo entrenado
-        X_test: Features de test
-        y_test: Target de test
-        X: Features completo (para validación cruzada)
-        y: Target completo (para validación cruzada)
-    
-    Returns:
-        Diccionario con todas las métricas
-    """
-    print_section("MÉTRICAS FINALES — GRADIENT BOOSTING")
-    
-    # Predicciones en conjunto de test
-    y_pred = gb_model.predict(X_test)
-    
-    # Cálculo de métricas
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae = mean_absolute_error(y_test, y_pred)
-    r2 = r2_score(y_test, y_pred)
-    
-    # MAPE
-    residuos = y_test.values - y_pred
-    mape = np.mean(np.abs(residuos / y_test.values)) * 100
-    
-    print(f"\n  RMSE (Root Mean Squared Error) : {rmse:.4f} GeV/c²")
-    print(f"  MAE  (Mean Absolute Error)     : {mae:.4f} GeV/c²")
-    print(f"  R²   (Coefficient of Determination): {r2:.6f}")
-    print(f"  MAPE (Mean Absolute Percentage Error): {mape:.2f} %")
-    
-    # Validación cruzada 5-fold
-    print("\nValidación cruzada (5-fold)...")
-    gb_cv = GradientBoostingRegressor(n_estimators=100, max_depth=5,
-                                       learning_rate=0.1, random_state=42)
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_rmse = np.sqrt(-cross_val_score(gb_cv, X, y, cv=kf,
-                                        scoring='neg_mean_squared_error', n_jobs=-1))
-    cv_r2 = cross_val_score(gb_cv, X, y, cv=kf, scoring='r2', n_jobs=-1)
-    
-    print(f"  RMSE CV promedio: {cv_rmse.mean():.4f} ± {cv_rmse.std():.4f} GeV/c²")
-    print(f"  R² CV promedio  : {cv_r2.mean():.6f} ± {cv_r2.std():.6f}")
-    
     metrics = {
-        'y_pred': y_pred,
-        'rmse': rmse,
-        'mae': mae,
-        'r2': r2,
-        'mape': mape,
-        'cv_rmse_mean': cv_rmse.mean(),
-        'cv_rmse_std': cv_rmse.std(),
-        'cv_r2_mean': cv_r2.mean(),
-        'cv_r2_std': cv_r2.std()
+        "test_rmse": float(np.sqrt(mean_squared_error(y_test, predictions))),
+        "test_mae": float(mean_absolute_error(y_test, predictions)),
+        "test_r2": float(r2_score(y_test, predictions)),
+        "test_mape": mape,
+        "cv_rmse_mean": float(cv_rmse.mean()),
+        "cv_rmse_std": float(cv_rmse.std()),
+        "cv_r2_mean": float(cv_r2.mean()),
+        "cv_r2_std": float(cv_r2.std()),
     }
-    
+    LOGGER.info(
+        "Métricas test: RMSE=%.4f | MAE=%.4f | R²=%.6f.",
+        metrics["test_rmse"],
+        metrics["test_mae"],
+        metrics["test_r2"],
+    )
     return metrics
 
 
-def display_feature_importance(gb_model, features):
-    """
-    Muestra la importancia de las features del modelo.
-    
-    Args:
-        gb_model: Modelo entrenado
-        features: Lista de nombres de features
-    """
-    print_section("IMPORTANCIA DE FEATURES")
-    
-    importancias = pd.Series(gb_model.feature_importances_, index=features)
-    importancias_sorted = importancias.sort_values(ascending=False)
-    
-    print("\nLas 10 variables más importantes:")
-    for i, (feature, importance) in enumerate(importancias_sorted.head(10).items(), 1):
-        print(f"  {i:2d}. {feature:8s} : {importance:.6f}")
-    
-    return importancias_sorted
+def save_artifacts(
+    model: GradientBoostingRegressor,
+    features: list[str],
+    metrics: dict[str, float],
+    best_parameters: dict[str, Any],
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    artifacts_dir: Path,
+) -> list[Path]:
+    """Guarda modelo, metadatos y relevancia de variables en rutas portables."""
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    model_path = artifacts_dir / "gradient_boosting_model.joblib"
+    metadata_path = artifacts_dir / "model_metadata.json"
+    importance_path = artifacts_dir / "feature_importances.csv"
 
-
-def save_artifacts(gb_model, scaler, best_params, metrics, features, target, 
-                   X_train, X_test, artifacts_dir="..\\artifacts"):
-    """
-    Guarda el modelo, scaler y metadatos en archivos.
-    
-    Args:
-        gb_model: Modelo entrenado
-        scaler: Scaler utilizado
-        best_params: Parámetros optimizados
-        metrics: Diccionario con métricas
-        features: Lista de features
-        target: Nombre de la variable objetivo
-        X_train: Features de entrenamiento
-        X_test: Features de test
-        artifacts_dir: Directorio donde guardar los artefactos
-    """
-    print_section("GUARDANDO ARTEFACTOS")
-    
-    os.makedirs(artifacts_dir, exist_ok=True)
-    
-    # Guardar modelo
-    model_path = os.path.join(artifacts_dir, "gb_model.pkl")
-    with open(model_path, 'wb') as f:
-        pickle.dump(gb_model, f)
-    print(f"✓ Modelo guardado en: {model_path}")
-    
-    # Guardar scaler
-    scaler_path = os.path.join(artifacts_dir, "scaler.pkl")
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f"✓ Scaler guardado en: {scaler_path}")
-    
-    # Guardar metadatos
+    joblib.dump(model, model_path)
     metadata = {
-        'features': features,
-        'target': target,
-        'best_params': best_params,
-        'metrics': {
-            'rmse': metrics['rmse'],
-            'mae': metrics['mae'],
-            'r2': metrics['r2'],
-            'mape': metrics['mape']
-        },
-        'cv_metrics': {
-            'cv_rmse_mean': metrics['cv_rmse_mean'],
-            'cv_rmse_std': metrics['cv_rmse_std'],
-            'cv_r2_mean': metrics['cv_r2_mean'],
-            'cv_r2_std': metrics['cv_r2_std']
-        },
-        'data_shapes': {
-            'X_train': X_train.shape,
-            'X_test': X_test.shape
-        }
+        "target": "M",
+        "features": features,
+        "best_parameters": best_parameters,
+        "metrics": metrics,
+        "data_shapes": {"x_train": list(x_train.shape), "x_test": list(x_test.shape)},
     }
-    
-    metadata_path = os.path.join(artifacts_dir, "model_metadata.pkl")
-    with open(metadata_path, 'wb') as f:
-        pickle.dump(metadata, f)
-    print(f"✓ Metadatos guardados en: {metadata_path}")
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (
+        pd.DataFrame({"feature": features, "importance": model.feature_importances_})
+        .sort_values("importance", ascending=False)
+        .to_csv(importance_path, index=False)
+    )
+    LOGGER.info("Artefactos guardados en: %s", artifacts_dir)
+    return [model_path, metadata_path, importance_path]
 
 
+def run_training(config: TrainingConfig) -> None:
+    """Ejecuta y registra el flujo de entrenamiento completo."""
+    mlflow.set_tracking_uri(config.tracking_uri)
+    mlflow.set_experiment(config.experiment_name)
 
-def main():
-    """Ejecuta el pipeline completo de entrenamiento del modelo."""
-    
-    # Configuración
-    DATASET_DIR = "..\\datasets"
-    CSV_FILE = os.path.join(DATASET_DIR, "dielectron.csv")
-    #ARTIFACTS_DIR = "..\\artifacts"
-    
-    # 1. Descarga y carga del dataset
-    df = download_and_load_dataset(DATASET_DIR, CSV_FILE)
-    
-    # 2. Preprocesamiento
-    X_train, X_test, y_train, y_test, scaler, X, y, features, target = preprocess_data(df)
-    
-    # 3. Búsqueda de hiperparámetros
-    best_params = optimize_hyperparameters(X_train, y_train, n_trials=10)
-    
-    # 4. Entrenamiento del modelo
-    gb_model = train_model(X_train, y_train, best_params)
-    
-    # 5. Evaluación
-    metrics = evaluate_model(gb_model, X_test, y_test, X, y)
-    
-    # 6. Feature importance
-    #display_feature_importance(gb_model, features)
-    
-    # 7. Guardar artefactos
-    #save_artifacts(gb_model, scaler, best_params, metrics, features, target,
-    #              X_train, X_test, ARTIFACTS_DIR)
-    
-    print_section("PIPELINE COMPLETADO EXITOSAMENTE")
+    with mlflow.start_run():
+        mlflow.log_params(
+            {
+                "random_state": config.random_state,
+                "test_size": config.test_size,
+                "n_trials": config.n_trials,
+                "cv_folds": config.cv_folds,
+                "model": "GradientBoostingRegressor",
+            }
+        )
+        dataframe = download_and_load_dataset(config.dataset_dir)
+        x_train, x_test, y_train, y_test, features = preprocess_data(
+            dataframe, config.random_state, config.test_size
+        )
+        best_parameters = optimize_hyperparameters(
+            x_train, y_train, config.random_state, config.n_trials
+        )
+        model = GradientBoostingRegressor(**best_parameters)
+        model.fit(x_train, y_train)
+        metrics = evaluate_model(
+            model,
+            x_test,
+            y_test,
+            x_train,
+            y_train,
+            config.cv_folds,
+            config.random_state,
+        )
+        artifact_paths = save_artifacts(
+            model,
+            features,
+            metrics,
+            best_parameters,
+            x_train,
+            x_test,
+            config.artifacts_dir,
+        )
+        mlflow.log_params({f"model_{key}": value for key, value in best_parameters.items()})
+        mlflow.log_metrics({key: value for key, value in metrics.items() if np.isfinite(value)})
+        mlflow.log_artifacts(str(config.artifacts_dir))
+        LOGGER.info("Ejecución registrada en MLflow; artefactos: %s", len(artifact_paths))
+
+
+def parse_args() -> TrainingConfig:
+    """Permite modificar los parámetros de prueba sin editar el código."""
+    parser = argparse.ArgumentParser(description="Entrena el modelo dielectron.")
+    parser.add_argument("--n-trials", type=int, default=10)
+    parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--test-size", type=float, default=0.20)
+    parser.add_argument("--dataset-dir", type=Path, default=PROJECT_ROOT / "datasets")
+    parser.add_argument("--artifacts-dir", type=Path, default=PROJECT_ROOT / "artifacts")
+    parser.add_argument(
+        "--tracking-uri",
+        default=os.getenv("MLFLOW_TRACKING_URI", f"sqlite:///{PROJECT_ROOT / 'mlflow.db'}"),
+    )
+    args = parser.parse_args()
+    return TrainingConfig(
+        dataset_dir=args.dataset_dir,
+        artifacts_dir=args.artifacts_dir,
+        tracking_uri=args.tracking_uri,
+        random_state=args.random_state,
+        test_size=args.test_size,
+        n_trials=args.n_trials,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    configure_logging()
+    run_training(parse_args())
