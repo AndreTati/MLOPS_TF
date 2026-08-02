@@ -6,8 +6,6 @@
 
 a2413, César Hernán Ruggeri
 
-a2512, Armando Tomás Civini
-
 a2521, Andrea Tatiana Duran
 
 a2525, Pablo David Gorosito
