@@ -1,0 +1,58 @@
+# Credenciales y configuración local
+.env
+.env.*
+!.env.example
+airflow/secrets/*
+!airflow/secrets/*.example.yaml
+*.pem
+*.key
+credentials.*
+secrets.*
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Python y Jupyter
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Datasets locales
+datasets/*
+!datasets/.gitkeep
+data/*
+!data/.gitkeep
+
+# Modelos y artefactos
+artifacts/
+models/
+outputs/
+*.pkl
+*.pickle
+*.joblib
+
+# MLflow
+mlflow.db
+mlartifacts/
+mlruns/
+
+# Airflow local
+airflow.db
+airflow-webserver.pid
+airflow/logs/
+logs/
+
+# Temporales y editores
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
