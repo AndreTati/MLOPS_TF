@@ -1,3 +1,4 @@
 pandas
 kagglehub
 scikit-learn
+awswrangler
