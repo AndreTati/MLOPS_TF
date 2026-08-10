@@ -19,7 +19,11 @@ def process_etl_split():
 
     #@task(task_id="download_and_upload")
     @task.virtualenv(
-        requirements=["awswrangler","pandas", "kagglehub"],  
+        requirements=[
+            "awswrangler==2.30.0",
+            "pandas==2.2.2",
+            "kagglehub==0.2.9",
+        ],
         system_site_packages=False
     )
     def download_and_upload() -> str:
@@ -71,7 +75,10 @@ def process_etl_split():
 
     
     @task.virtualenv(
-        requirements=["awswrangler"],  
+        requirements=[
+            "awswrangler==2.30.0",
+            "pandas==2.2.2",
+        ],
         system_site_packages=False
     )
     def etl_data(s3_uri: str) -> str:
@@ -100,7 +107,12 @@ def process_etl_split():
 
     
     @task.virtualenv(
-        requirements=["awswrangler", "scikit-learn"],  
+        requirements=[
+            "awswrangler==2.30.0",
+            "scikit-learn==1.5.0",
+            "pandas==2.2.2",
+            "numpy==1.26.4",
+        ],
         system_site_packages=False
     )
     def split_data(s3_uri):
@@ -132,7 +144,14 @@ def process_etl_split():
        
 
     @task.virtualenv(
-        requirements=["awswrangler", "scikit-learn", "mlflow", "optuna"],
+        requirements=[
+            "awswrangler==2.30.0",
+            "scikit-learn==1.5.0",
+            "mlflow==2.14.3",
+            "optuna==3.6.1",
+            "pandas==2.2.2",
+            "numpy==1.26.4",
+        ],
         system_site_packages=False
     )
     def train_model():
@@ -198,6 +217,16 @@ def process_etl_split():
                 signature=signature,
                 registered_model_name="dielectron_mass_regressor",
             )
+
+            client = mlflow.MlflowClient()
+            latest_versions = client.get_latest_versions("dielectron_mass_regressor")
+            if latest_versions:
+                best_registered = max(latest_versions, key=lambda version: int(version.version))
+                client.set_registered_model_alias(
+                    name="dielectron_mass_regressor",
+                    alias="champion",
+                    version=best_registered.version,
+                )
 
             print(f"Métricas finales: {metrics}")
 
