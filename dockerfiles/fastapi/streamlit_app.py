@@ -58,10 +58,3 @@ if submit_button:
         st.error(f"Error al llamar a la API de FastAPI: {exc}")
         if exc.response is not None:
             st.json(exc.response.text)
-
-st.markdown("---")
-st.subheader("Variables del dataset")
-st.write(
-    "Este modelo usa las características del dataset `dielectron.csv` para predecir la masa invariante `M`. "
-    "No se usan las columnas `Run` ni `Event` porque son identificadores."
-)
