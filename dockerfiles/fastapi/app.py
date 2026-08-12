@@ -319,6 +319,19 @@ def predict(features: DielectronInput, background_tasks: BackgroundTasks) -> Pre
         std = pd.Series(std, index=columns_after_dummy)
         input_df = (input_df - mean) / std
 
+    
+    expected_columns = getattr(model, "feature_names_in_", None)
+    if expected_columns is not None:
+        rename_map = {
+            col: expected
+            for col in input_df.columns
+            for expected in expected_columns
+            if col != expected and col.strip() == expected.strip()
+        }
+        if rename_map:
+            input_df = input_df.rename(columns=rename_map)
+        input_df = input_df.reindex(columns=list(expected_columns), fill_value=0)
+
     try:
         prediction = model.predict(input_df)
     except Exception as exc:
