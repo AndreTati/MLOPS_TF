@@ -1,28 +1,8 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
-#
-# Modified by Facundo Lucianna on July 12, 2025, based on the 
-# original file from the ASF.
-
-# WARNING: This configuration is for local development. Do not use it in a production deployment.
 x-airflow-common: &airflow-common
   build: './dockerfiles/airflow'
   image: ${AIRFLOW_IMAGE_NAME:-extending_airflow:latest}
   environment: &airflow-common-env
+    AIRFLOW__API__BASE_URL: http://${HOST_IP:-localhost}:${AIRFLOW_PORT:-8080}
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor # LocalExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PG_USER:-airflow}:${PG_PASSWORD:-airflow}@postgres/${PG_DATABASE:-airflow}
@@ -42,8 +22,7 @@ x-airflow-common: &airflow-common
     AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY:-minio123}
     AWS_ENDPOINT_URL_S3: http://s3:9000
     AWS_DEFAULT_REGION: us-east-1
-    #AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.session'
-    #AIRFLOW__CORE__TEST_CONNECTION: 'Enabled'
+    MLFLOW_S3_ENDPOINT_URL: http://s3:9000
     MLFLOW_TRACKING_URI: http://mlflow:5000
   volumes:
     - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
@@ -66,7 +45,7 @@ services:
     image: postgres:13
     container_name: postgres
     ports:
-      - "${PG_PORT:-5432}:5432"
+      - "${PG_PORT:-5433}:5432"
     networks:
       - backend
     environment:
@@ -74,11 +53,11 @@ services:
       - POSTGRES_PASSWORD=${PG_PASSWORD:-airflow}
       - POSTGRES_HOST=postgres
       - POSTGRES_DB=${PG_DATABASE:-airflow}
-      - POSTGRES_PORT=${PG_PORT:-5432}
+      - POSTGRES_PORT=${PG_PORT:-5433}
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD", "pg_isready", "-p", "5432", "-U", "${PG_USER:-postgres}" ]
+      test: [ "CMD", "pg_isready", "-p", "5432", "-U", "${PG_USER:-airflow}" ]
       interval: 60s
       timeout: 20s
       retries: 3
@@ -314,14 +293,14 @@ services:
     image: minio/mc:latest
     container_name: minio_create_bucket
     depends_on:
-      - s3
+      s3:
+        condition: service_healthy
     networks:
       - backend
     entrypoint: >
       /bin/sh -c ' sleep 5; /usr/bin/mc alias set s3 http://s3:9000 ${MINIO_ACCESS_KEY:-minio} ${MINIO_SECRET_ACCESS_KEY:-minio123}; /usr/bin/mc mb s3/${BUCKET_NAME:-data}; exit 0; '
 
-
-mlflow:
+  mlflow:
     restart: always
     build: './dockerfiles/mlflow'
     container_name: mlflow
@@ -332,13 +311,22 @@ mlflow:
     environment:
       AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-minio}
       AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY:-minio123}
+      AWS_ENDPOINT_URL_S3: http://s3:9000
       MLFLOW_S3_ENDPOINT_URL: http://s3:9000
     volumes:
       - mlflow_data:/mlflow_data
     depends_on:
-      - s3
+      postgres:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://mlflow:5000/ || exit 1
+      interval: 60s
+      timeout: 10s
+      retries: 3
 
-create_mlflow_bucket:
+  create_mlflow_bucket:
     image: minio/mc:latest
     depends_on:
       - s3
@@ -347,37 +335,49 @@ create_mlflow_bucket:
     entrypoint: >
       /bin/sh -c ' sleep 5; /usr/bin/mc alias set s3 http://s3:9000 ${MINIO_ACCESS_KEY:-minio} ${MINIO_SECRET_ACCESS_KEY:-minio123}; /usr/bin/mc mb s3/mlflow; exit 0; '
 
-fastapi:
+  fastapi:
     build:
       context: ./dockerfiles/fastapi
     container_name: fastapi
     ports:
-      - "8800:8800"
+      - "${FASTAPI_PORT:-8800}:8800"
     networks:
       - backend
     environment:
+      - MODEL_URI=file:///app/files/model.pkl
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY:-minio}
       - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY:-minio123}
       - AWS_ENDPOINT_URL_S3=http://s3:9000
     depends_on:
-      - mlflow
-      - s3
+      mlflow:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+      airflow-apiserver:
+        condition: service_healthy
     command: uvicorn app:app --host 0.0.0.0 --port 8800
+    healthcheck:
+      test: curl --include --request GET http://fastapi:8800/ || exit 1
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 120s
 
-streamlit:
+  streamlit:
     build:
       context: ./dockerfiles/fastapi
     container_name: streamlit
     ports:
-      - "8501:8501"
+      - "${STREAMLIT_PORT:-8501}:8501"
     networks:
       - backend
     environment:
       - FASTAPI_URL=http://fastapi:8800
     depends_on:
-      - fastapi
-    command: streamlit run /app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+      fastapi:
+        condition: service_healthy
+    command: streamlit run /app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
 
 networks:
   backend:

@@ -1,47 +1,164 @@
 import json
 import os
+import pickle
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import mlflow
+import numpy as np
+import boto3
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from mlflow.tracking import MlflowClient
 from pydantic import BaseModel, Field
 
 MODEL_NAME = "dielectron_mass_regressor"
-MODEL_ALIAS = "champion"
-PREPROCESS_CONFIG_PATH = "/app/files/data.json"
+MODEL_ALIAS = "thebest"
+PREPROCESS_CONFIG_PATH = Path(__file__).resolve().parent / "files" / "data.json"
+FALLBACK_MODEL_PATH = Path(__file__).resolve().parent / "files" / "model.pkl"
 
 
-def load_model(model_name: str = MODEL_NAME, alias: str = MODEL_ALIAS) -> tuple[Any, str, str]:
+def _load_pickle_model(path: Path) -> Any:
+    try:
+        return pickle.loads(path.read_bytes())
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load pickle model from {path}: {exc}") from exc
+
+
+def _resolve_file_path(model_uri: str) -> Path | None:
+    parsed = urlparse(model_uri)
+    if parsed.scheme == "file":
+        return Path(parsed.path)
+    if parsed.scheme == "":
+        return Path(model_uri)
+    return None
+
+
+def load_model(model_name: str = MODEL_NAME, alias: str = MODEL_ALIAS) -> tuple[Any, int, dict]:
+    """
+    Load model (from MODEL_URI env, fallback pickle, or MLflow registry) and the preprocessing
+    data dictionary from S3 (or local fallback file).
+
+    Returns: (model, version, data_dict)
+    """
+    global loaded_source
+    # Prefer loading from MLflow registry first
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
-    mlflow.set_tracking_uri(tracking_uri)
-    client = MlflowClient()
-
     try:
-        registered_version = client.get_model_version_by_alias(model_name, alias)
-        model_source = registered_version.source
-        model_version = registered_version.version
+        mlflow.set_tracking_uri(tracking_uri)
+        client = mlflow.MlflowClient()
+
+        try:
+            registered_version = client.get_model_version_by_alias(model_name, alias)
+            model_source = registered_version.source
+            model_version = int(registered_version.version)
+        except Exception:
+            versions = client.get_latest_versions(model_name)
+            if not versions:
+                raise RuntimeError(
+                    f"No registered versions found for model '{model_name}' at {tracking_uri}."
+                )
+            latest_version = max(versions, key=lambda version: int(version.version))
+            model_source = latest_version.source
+            model_version = int(latest_version.version)
+
+        model = mlflow.sklearn.load_model(model_source)
+        loaded_source = model_source
     except Exception:
-        versions = client.get_latest_versions(model_name)
-        if not versions:
-            raise RuntimeError(
-                f"No registered versions found for model '{model_name}' at {tracking_uri}."
-            )
-        latest_version = max(versions, key=lambda version: int(version.version))
-        model_source = latest_version.source
-        model_version = latest_version.version
+        # If MLflow loading fails, fallback to MODEL_URI env or local file
+        model_uri = os.getenv("MODEL_URI")
+        global loaded_source
+        if model_uri:
+            path = _resolve_file_path(model_uri)
+            if path is not None and path.suffix == ".pkl":
+                model = _load_pickle_model(path)
+                loaded_source = str(path)
+                data_dictionary = load_preprocessing_config()
+                return model, 0, data_dictionary
 
-    model = mlflow.sklearn.load_model(model_source)
-    return model, model_version, model_source
+            model = mlflow.sklearn.load_model(model_uri)
+            loaded_source = model_uri
+            data_dictionary = load_preprocessing_config()
+            return model, 0, data_dictionary
 
+        if FALLBACK_MODEL_PATH.exists():
+            model = _load_pickle_model(FALLBACK_MODEL_PATH)
+            loaded_source = str(FALLBACK_MODEL_PATH)
+            data_dictionary = load_preprocessing_config()
+            return model, 0, data_dictionary
 
-def load_preprocessing_config(path: str = PREPROCESS_CONFIG_PATH) -> dict[str, Any]:
+    # Load preprocessing/data dictionary from S3 (bucket 'data', key 'data_info/data.json')
+    data_dictionary = None
     try:
-        with open(path, "r", encoding="utf-8") as file:
-            config = json.load(file)
+        s3 = boto3.client("s3")
+        resp = s3.get_object(Bucket="data", Key="data_info/data.json")
+        text = resp["Body"].read().decode("utf-8")
+        data_dictionary = json.loads(text)
+
+        # Convert scaler lists to numpy arrays if present
+        if "standard_scaler_mean" in data_dictionary:
+            data_dictionary["standard_scaler_mean"] = np.array(data_dictionary["standard_scaler_mean"])
+        if "standard_scaler_std" in data_dictionary:
+            data_dictionary["standard_scaler_std"] = np.array(data_dictionary["standard_scaler_std"])
+    except Exception:
+        # Fallback to local preprocessing config
+        data_dictionary = load_preprocessing_config()
+
+    return model, model_version, data_dictionary
+
+
+def check_model() -> None:
+    """
+    Check the MLflow registry for an updated 'champion' version and reload model/data_dict if changed.
+    """
+    global model, version_model, loaded_source, data_dict
+    try:
+        mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000"))
+        client = MlflowClient()
+        new_version = None
+        try:
+            mv = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
+            new_version = int(mv.version)
+        except Exception:
+            versions = client.get_latest_versions(MODEL_NAME)
+            if versions:
+                new_version = max(versions, key=lambda v: int(v.version)).version
+
+        if new_version is not None and version_model is not None and int(new_version) != int(version_model):
+            # reload
+            m, v, new_data_dict = load_model(MODEL_NAME, MODEL_ALIAS)
+            model = m
+            version_model = v
+            data_dict = new_data_dict
+    except Exception:
+        # silently ignore errors during asynchronous checks
+        pass
+
+
+def load_preprocessing_config(path: Path | str = PREPROCESS_CONFIG_PATH) -> dict[str, Any]:
+    config_path = Path(path)
+    try:
+        raw_bytes = config_path.read_bytes()
     except FileNotFoundError as exc:
-        raise RuntimeError(f"Preprocessing config not found at {path}") from exc
+        raise RuntimeError(f"Preprocessing config not found at {config_path}") from exc
+
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
+
+    try:
+        config = json.loads(raw_bytes.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to decode preprocessing config {config_path}: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to parse preprocessing config {config_path}: {exc}"
+        ) from exc
+
     return config
 
 
@@ -64,7 +181,7 @@ class DielectronInput(BaseModel):
     Q2: float = Field(description="Charge of the second electron")
 
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "E1": 50.0,
                 "px1": 15.0,
@@ -91,23 +208,35 @@ class PredictionOutput(BaseModel):
 
 
 model = None
-loaded_version = None
+version_model = None
 loaded_source = None
-preprocess_config: dict[str, Any] | None = None
+data_dict: dict[str, Any] | None = None
+
+# Cargar modelo y configuración al inicio (intentar, pero no fallar la importación)
+try:
+    model, version_model, data_dict = load_model(MODEL_NAME, MODEL_ALIAS)
+except Exception:
+    model = None
+    version_model = None
+    data_dict = None
 
 
 def get_model() -> Any:
-    global model, loaded_version, loaded_source
+    global model, version_model, data_dict
     if model is None:
-        model, loaded_version, loaded_source = load_model()
+        model, version_model, data_dict = load_model()
     return model
 
 
 def get_preprocessing_config() -> dict[str, Any]:
-    global preprocess_config
-    if preprocess_config is None:
-        preprocess_config = load_preprocessing_config()
-    return preprocess_config
+    global data_dict
+    if data_dict is None:
+        # try to reload from S3 or local
+        try:
+            _, _, data_dict = load_model()
+        except Exception:
+            data_dict = load_preprocessing_config()
+    return data_dict
 
 
 app = FastAPI(title="Dielectron Mass Regression API")
@@ -119,9 +248,10 @@ def startup_event() -> None:
         get_model()
         get_preprocessing_config()
     except Exception as exc:
-        raise RuntimeError(
-            f"Failed to initialize FastAPI: {exc}"
-        ) from exc
+        # Don't fail application startup if MLflow or model isn't ready yet.
+        # Log the error so the container stays up and we can retry loading on demand.
+        import sys
+        print(f"Warning: failed to initialize FastAPI resources: {exc}", file=sys.stderr)
 
 
 @app.get("/")
@@ -134,21 +264,30 @@ def model_info() -> dict[str, str]:
     return {
         "model_name": MODEL_NAME,
         "alias": MODEL_ALIAS,
-        "version": str(loaded_version),
+        "version": str(version_model),
         "source": str(loaded_source),
     }
 
 
 @app.post("/predict/", response_model=PredictionOutput)
-def predict(features: DielectronInput) -> PredictionOutput:
-    model = get_model()
-    config = get_preprocessing_config()
+def predict(features: DielectronInput, background_tasks: BackgroundTasks) -> PredictionOutput:
+    # Ensure model is loaded
+    if model is None:
+        try:
+            get_model()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # Schedule an asynchronous check for model updates
+    background_tasks.add_task(check_model)
+
+    config = data_dict or load_preprocessing_config()
     columns = config["columns"]
     columns_after_dummy = config.get("columns_after_dummy", columns)
     categorical_columns = config.get("categorical_columns", [])
     categories_map = config.get("categories_values_per_categorical", {})
 
-    input_df = pd.DataFrame([features.dict()])[columns]
+    input_df = pd.DataFrame([features.dict()])
 
     if categorical_columns:
         for categorical_col in categorical_columns:
@@ -167,9 +306,13 @@ def predict(features: DielectronInput) -> PredictionOutput:
 
     input_df = input_df.reindex(columns=columns_after_dummy, fill_value=0)
 
-    if config.get("standard_scaler_mean") and config.get("standard_scaler_std"):
-        mean = pd.Series(config["standard_scaler_mean"], index=columns_after_dummy)
-        std = pd.Series(config["standard_scaler_std"], index=columns_after_dummy)
+    # Apply scaling if provided
+    if config.get("standard_scaler_mean") is not None and config.get("standard_scaler_std") is not None:
+        mean = np.array(config["standard_scaler_mean"])
+        std = np.array(config["standard_scaler_std"])
+        # Ensure alignment with columns_after_dummy
+        mean = pd.Series(mean, index=columns_after_dummy)
+        std = pd.Series(std, index=columns_after_dummy)
         input_df = (input_df - mean) / std
 
     try:
