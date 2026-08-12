@@ -349,6 +349,8 @@ services:
       - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY:-minio}
       - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY:-minio123}
       - AWS_ENDPOINT_URL_S3=http://s3:9000
+    volumes:
+      - ./dockerfiles/fastapi:/app
     depends_on:
       mlflow:
         condition: service_healthy
@@ -356,7 +358,7 @@ services:
         condition: service_healthy
       airflow-apiserver:
         condition: service_healthy
-    command: uvicorn app:app --host 0.0.0.0 --port 8800
+    command: uvicorn app:app --host 0.0.0.0 --port 8800 --reload
     healthcheck:
       test: curl --include --request GET http://fastapi:8800/ || exit 1
       interval: 60s
@@ -374,10 +376,12 @@ services:
       - backend
     environment:
       - FASTAPI_URL=http://fastapi:8800
+    volumes:
+      - ./dockerfiles/fastapi:/app
     depends_on:
       fastapi:
         condition: service_healthy
-    command: streamlit run /app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    command: streamlit run /app/streamlit_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true --server.runOnSave true
 
 networks:
   backend:

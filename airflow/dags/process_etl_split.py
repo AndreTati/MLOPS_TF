@@ -249,13 +249,19 @@ def process_etl_split():
             mlflow.log_metrics(metrics)
 
             signature = infer_signature(X_train, best_model.predict(X_train))
-            mlflow.sklearn.log_model(
+            model_info = mlflow.sklearn.log_model(
                 sk_model=best_model,
                 artifact_path="model",
                 signature=signature,
                 registered_model_name="dielectron_mass_regressor",
             )
-            mlflow.set_tag("alias", "thebest")
+
+            client = mlflow.MlflowClient()
+            client.set_registered_model_alias(
+                name="dielectron_mass_regressor",
+                alias="thebest",
+                version=model_info.registered_model_version,
+            )
 
             print(f"Métricas finales: {metrics}")
 

@@ -67,28 +67,32 @@ def load_model(model_name: str = MODEL_NAME, alias: str = MODEL_ALIAS) -> tuple[
 
         model = mlflow.sklearn.load_model(model_source)
         loaded_source = model_source
-    except Exception:
+    except Exception as mlflow_exc:
         # If MLflow loading fails, fallback to MODEL_URI env or local file
         model_uri = os.getenv("MODEL_URI")
-        global loaded_source
         if model_uri:
             path = _resolve_file_path(model_uri)
             if path is not None and path.suffix == ".pkl":
-                model = _load_pickle_model(path)
-                loaded_source = str(path)
-                data_dictionary = load_preprocessing_config()
-                return model, 0, data_dictionary
-
-            model = mlflow.sklearn.load_model(model_uri)
-            loaded_source = model_uri
-            data_dictionary = load_preprocessing_config()
-            return model, 0, data_dictionary
+                if path.exists():
+                    model = _load_pickle_model(path)
+                    loaded_source = str(path)
+                    return model, 0, load_preprocessing_config()
+                # MODEL_URI points at a local pickle that isn't there yet;
+                # fall through to FALLBACK_MODEL_PATH below instead of failing outright.
+            else:
+                model = mlflow.sklearn.load_model(model_uri)
+                loaded_source = model_uri
+                return model, 0, load_preprocessing_config()
 
         if FALLBACK_MODEL_PATH.exists():
             model = _load_pickle_model(FALLBACK_MODEL_PATH)
             loaded_source = str(FALLBACK_MODEL_PATH)
-            data_dictionary = load_preprocessing_config()
-            return model, 0, data_dictionary
+            return model, 0, load_preprocessing_config()
+
+        raise RuntimeError(
+            f"No se pudo cargar el modelo: la carga desde MLflow falló ({mlflow_exc}) y no "
+            f"hay un modelo utilizable en MODEL_URI ni en {FALLBACK_MODEL_PATH}."
+        ) from mlflow_exc
 
     # Load preprocessing/data dictionary from S3 (bucket 'data', key 'data_info/data.json')
     data_dictionary = None
