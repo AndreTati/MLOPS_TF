@@ -67,3 +67,59 @@ final/train/dielectron_X_train.csv
 final/train/dielectron_y_train.csv
 final/test/dielectron_X_test.csv
 final/test/dielectron_y_test.csv
+```
+
+## 5. Puesta en marcha
+
+### Requisitos
+
+- Docker y Docker Compose.
+- Conexión a Internet para descargar el dataset desde Kaggle si no está disponible localmente.
+
+### Cómo levantar el proyecto
+
+1. Clonar el repositorio y situarse en la raíz del proyecto:
+
+```bash
+git clone <repo-url>
+cd MLOPS_TF
+```
+
+2. Levantar los servicios con Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+3. Crear los buckets de MinIO si no se crean automáticamente:
+
+```bash
+docker compose up -d create_s3_buckets
+```
+
+### Ejecutar el pipeline de Airflow
+
+1. Abrir Airflow en el navegador:
+
+- `http://localhost:8080`
+
+2. Desencadenar el DAG `process_etl_split` desde la interfaz de Airflow.
+
+3. Alternativamente, usar el CLI de Airflow:
+
+```bash
+docker compose exec airflow-cli airflow dags trigger process_etl_split
+```
+
+4. Confirmar que los archivos se crean en MinIO bajo `s3://data/final/`.
+
+### Acceso a servicios
+
+- MLflow: `http://localhost:5000`
+- FastAPI: `http://localhost:8800`
+- Streamlit: `http://localhost:8501`
+
+### Notas
+
+- El DAG descarga el dataset, elimina `Run` y `Event`, divide en train/test y entrena el modelo `dielectron_mass_regressor` en MLflow.
+- La API FastAPI y la interfaz Streamlit consumen el modelo registrado en MLflow.

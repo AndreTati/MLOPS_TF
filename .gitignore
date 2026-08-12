@@ -33,7 +33,6 @@ data/*
 artifacts/
 models/
 outputs/
-*.pkl
 *.pickle
 *.joblib
 

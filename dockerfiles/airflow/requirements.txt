@@ -1,4 +1,4 @@
-pandas
+pandas==2.0
 kagglehub
-scikit-learn
-awswrangler
+scikit-learn==1.3
+awswrangler==3.17.1

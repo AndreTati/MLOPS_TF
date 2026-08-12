@@ -71,30 +71,87 @@ def process_etl_split():
 
     
     @task.virtualenv(
-        requirements=["awswrangler"],  
+        requirements=[
+            "awswrangler==3.6.0",
+            "pandas==2.1.3",
+            "numpy==1.26.4",
+            "boto3==1.28.0",
+            "botocore==1.31.0",
+        ],
         system_site_packages=False
     )
     def etl_data(s3_uri: str) -> str:
         """
         Realiza un ETL simple sobre el dataset descargado y subido a S3.
+        - Lee CSV desde `s3_uri`
+        - Limpia (dropna, drop_duplicates), elimina columnas innecesarias
+        - Guarda procesado en `s3://data/processed/processed_data.csv`
+        - Genera/actualiza `s3://data/data_info/data.json` con metadata (columns, dtypes, target opcional)
         Devuelve la URI S3 del archivo procesado.
         """
+        import json
+        import datetime
         import awswrangler as wr
+        import pandas as pd
+        import numpy as np
+        import boto3
+        import botocore
 
-        
+        # Leer dataset
         dataset = wr.s3.read_csv(s3_uri)
 
-        # Procesamiento simple: eliminar filas con valores nulos
-        df_cleaned = dataset.dropna()
-        print("Filas después de limpiar nulos: %s", df_cleaned.shape)
+        # Procesamiento simple: eliminar filas con valores nulos y duplicados
+        df_cleaned = dataset.dropna().drop_duplicates(ignore_index=True)
+        print("Filas después de limpiar nulos y duplicados:", df_cleaned.shape)
 
-        #Eliminar columnas innecesarias
-        df_cleaned = df_cleaned.drop(columns=['Run', 'Event'], errors='ignore')
-        print("Columnas después de eliminar innecesarias: %s", df_cleaned.shape)
+        # Eliminar columnas innecesarias si existen
+        df_cleaned = df_cleaned.drop(columns=["Run", "Event"], errors="ignore")
+        print("Columnas después de eliminar innecesarias:", df_cleaned.shape)
 
         # Guardar el DataFrame procesado en un nuevo archivo CSV en S3
         processed_s3_uri = "s3://data/processed/processed_data.csv"
         wr.s3.to_csv(df=df_cleaned, path=processed_s3_uri, index=False)
+
+        # --- guarda/actualiza metadata en S3 como data_info/data.json ---
+        bucket = "data"
+        key = "data_info/data.json"
+        client = boto3.client("s3")
+
+        existing = {}
+        try:
+            resp = client.get_object(Bucket=bucket, Key=key)
+            existing_text = resp["Body"].read().decode("utf-8")
+            existing = json.loads(existing_text)
+        except botocore.exceptions.ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            # Si no existe el objeto, seguimos con existing = {}
+            if code not in ("NoSuchKey", "404", "NotFound"):
+                # Otro error: relanzar para que Airflow marque fallo (o capturar según prefieras)
+                raise
+
+        # Construir metadata
+        metadata = {
+            "columns": df_cleaned.columns.to_list(),
+            "columns_dtypes": {k: str(v) for k, v in df_cleaned.dtypes.to_dict().items()},
+            "categorical_columns": [],  # no tienes categóricas
+            "categories_values_per_categorical": {},
+            "date": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+        # Incluir target si existe (opcional)
+        if "M" in df_cleaned.columns:
+            metadata["target_col"] = "M"
+
+        # Merge sencillo: metadata sobrescribe campos existentes
+        existing.update(metadata)
+
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(existing, indent=2).encode("utf-8"),
+        )
+        # --- fin metadata ---
+
         return processed_s3_uri
     
 
@@ -132,7 +189,7 @@ def process_etl_split():
        
 
     @task.virtualenv(
-        requirements=["awswrangler", "scikit-learn", "mlflow", "optuna"],
+        requirements=["setuptools<81","awswrangler", "scikit-learn", "mlflow==2.14.3", "optuna", "numpy==1.26"],
         system_site_packages=False
     )
     def train_model():
@@ -192,11 +249,18 @@ def process_etl_split():
             mlflow.log_metrics(metrics)
 
             signature = infer_signature(X_train, best_model.predict(X_train))
-            mlflow.sklearn.log_model(
+            model_info = mlflow.sklearn.log_model(
                 sk_model=best_model,
                 artifact_path="model",
                 signature=signature,
                 registered_model_name="dielectron_mass_regressor",
+            )
+
+            client = mlflow.MlflowClient()
+            client.set_registered_model_alias(
+                name="dielectron_mass_regressor",
+                alias="thebest",
+                version=model_info.registered_model_version,
             )
 
             print(f"Métricas finales: {metrics}")
