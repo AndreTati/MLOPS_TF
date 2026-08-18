@@ -189,7 +189,7 @@ def process_etl_split():
        
 
     @task.virtualenv(
-        requirements=["setuptools<81","awswrangler", "scikit-learn", "mlflow==2.14.3", "optuna", "numpy==1.26"],
+        requirements=["setuptools<81","awswrangler", "scikit-learn==1.9.0", "mlflow==2.14.3", "optuna", "numpy==1.26"],
         system_site_packages=False
     )
     def train_model():
