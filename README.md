@@ -70,7 +70,7 @@ cd MLOPS_TF
 2. Crear el archivo de variables de entorno a partir del ejemplo y completar los valores locales:
 
 ```bash
-cp .env.example .env
+cp .env
 ```
 
 3. Crear los archivos de secrets de Airflow a partir de los ejemplos:
