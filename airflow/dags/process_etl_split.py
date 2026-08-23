@@ -19,7 +19,7 @@ def process_etl_split():
 
     #@task(task_id="download_and_upload")
     @task.virtualenv(
-        requirements=["awswrangler","pandas", "kagglehub"],  
+        requirements=["awswrangler==3.6.0","pandas==2.1.3","kagglehub==1.0.2"],  
         system_site_packages=False
     )
     def download_and_upload() -> str:
@@ -157,7 +157,7 @@ def process_etl_split():
 
     
     @task.virtualenv(
-        requirements=["awswrangler", "scikit-learn"],  
+        requirements=["awswrangler==3.6.0", "scikit-learn==1.9.0"],  
         system_site_packages=False
     )
     def split_data(s3_uri):
@@ -189,7 +189,7 @@ def process_etl_split():
        
 
     @task.virtualenv(
-        requirements=["setuptools<81","awswrangler", "scikit-learn==1.9.0", "mlflow==2.14.3", "optuna", "numpy==1.26"],
+        requirements=["setuptools<81","awswrangler==3.6.0", "scikit-learn==1.9.0", "mlflow==2.14.3", "optuna==4.4.0", "numpy==1.26"],
         system_site_packages=False
     )
     def train_model():
